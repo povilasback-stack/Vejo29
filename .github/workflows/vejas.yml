@@ -1,0 +1,152 @@
+name: Vejo pranesimai
+
+on:
+  schedule:
+    - cron: "17,47 * * * *"
+  workflow_dispatch:
+    inputs:
+      test:
+        description: "Siusti bandomaja zinute nepriklausomai nuo krypties"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: vejo-pranesimai
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Tikrinti veja
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TEST_MODE: ${{ inputs.test }}
+        run: |
+          python - <<'PY'
+          import json
+          import math
+          import os
+          import sys
+          import urllib.request
+          import urllib.parse
+          from pathlib import Path
+          from datetime import datetime, timezone
+
+          def request_json(url, data=None):
+              try:
+                  req = urllib.request.Request(url, data=data)
+                  with urllib.request.urlopen(req, timeout=30) as response:
+                      return json.load(response)
+              except Exception:
+                  raise RuntimeError("API uzklausa nepavyko. Bandykite vel.") from None
+
+          def main():
+              token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+              chat = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+              test = os.environ.get("TEST_MODE", "").lower() == "true"
+
+              if not token or not chat:
+                  raise RuntimeError("Truksta TELEGRAM_BOT_TOKEN arba TELEGRAM_CHAT_ID.")
+
+              params = urllib.parse.urlencode({
+                  "latitude": 55.4566591,
+                  "longitude": 21.1061368,
+                  "current": "wind_speed_10m,wind_direction_10m,wind_gusts_10m",
+                  "wind_speed_unit": "ms",
+                  "timezone": "Europe/Vilnius",
+                  "timeformat": "unixtime",
+              })
+              weather = request_json(
+                  "https://api.open-meteo.com/v1/forecast?" + params
+              )
+              current = weather["current"]
+              direction = float(current["wind_direction_10m"])
+              speed = float(current["wind_speed_10m"])
+              gusts = float(current["wind_gusts_10m"])
+              timestamp = float(current["time"])
+
+              if not all(math.isfinite(v) for v in
+                         (direction, speed, gusts, timestamp)):
+                  raise RuntimeError("Netinkami vejo duomenys.")
+              if not 0 <= direction <= 360 or speed < 0 or gusts < 0:
+                  raise RuntimeError("Vejo duomenys uz leistinu ribu.")
+              age = datetime.now(timezone.utc).timestamp() - timestamp
+              if not -1800 <= age <= 7200:
+                  raise RuntimeError("Vejo duomenys pasene.")
+
+              inside = 90 <= direction <= 135
+              state_file = Path("wind_state.json")
+              previous = False
+              if state_file.exists():
+                  previous = json.loads(
+                      state_file.read_text()
+                  )["inside"]
+                  if not isinstance(previous, bool):
+                      raise RuntimeError("Netinkamas busenos failas.")
+
+              if test or (inside and not previous):
+                  from zoneinfo import ZoneInfo
+                  local_time = datetime.fromtimestamp(
+                      timestamp, ZoneInfo("Europe/Vilnius")
+                  ).strftime("%Y-%m-%d %H:%M")
+                  title = "🧪 Bandomoji žinutė" if test else "🌬 Vėjo pranešimas"
+                  condition = "TAIP" if inside else "NE"
+                  text = (
+                      f"{title}\n"
+                      "📍 55.4566591, 21.1061368\n"
+                      f"Kryptis iš: {direction:.0f}°\n"
+                      f"Greitis: {speed:.1f} m/s\n"
+                      f"Gūsiai: {gusts:.1f} m/s\n"
+                      f"90–135° intervale: {condition}\n"
+                      f"Duomenų laikas: {local_time}\n"
+                      "Šaltinis: Open-Meteo (modelio duomenys)"
+                  )
+                  payload = urllib.parse.urlencode({
+                      "chat_id": chat,
+                      "text": text,
+                  }).encode()
+                  result = request_json(
+                      f"https://api.telegram.org/bot{token}/sendMessage",
+                      payload,
+                  )
+                  if not result.get("ok"):
+                      raise RuntimeError("Telegram nepatvirtino siuntimo.")
+                  print("Zinute issiusta.")
+              else:
+                  print("Naujo pranesimo nereikia.")
+
+              if not test:
+                  state_file.write_text(
+                      json.dumps({"inside": inside}) + "\n"
+                  )
+
+          try:
+              main()
+          except Exception as error:
+              print(f"Klaida: {error}", file=sys.stderr)
+              sys.exit(1)
+          PY
+
+      - name: Issaugoti ankstesne vejo busena
+        run: |
+          if [ -f wind_state.json ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add wind_state.json
+            if ! git diff --cached --quiet; then
+              git commit -m "Update wind state"
+              git push
+            fi
+          fi
