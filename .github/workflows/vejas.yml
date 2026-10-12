@@ -52,3 +52,4 @@ jobs:
               service = (
                   "Telegram"
                   if urllib.parse.urlparse(url).hostname == "api.telegram.org"
+            git push
