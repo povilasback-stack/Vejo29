@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       test:
-        description: "Siusti bandomaja zinute"
+        description: "Siusti bandomaja suvestine"
         type: boolean
         default: true
 
@@ -27,7 +27,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Tikrinti veja
+      - name: Tikrinti veja ir prognoze
         env:
           TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -37,8 +37,12 @@ jobs:
           import json, os, sys, math
           import urllib.request, urllib.parse, urllib.error
           from pathlib import Path
-          from datetime import datetime, timezone
+          from datetime import datetime, timedelta
           from zoneinfo import ZoneInfo
+
+          MIN_SPEED = 6.0
+          ZONE = ZoneInfo("Europe/Vilnius")
+          STATE = Path("wind_alert_state.json")
 
           def api(url, service, data=None):
               try:
@@ -50,6 +54,45 @@ jobs:
               except Exception:
                   raise RuntimeError(f"{service}: rysio arba atsakymo klaida") from None
 
+          def values(d, s, g):
+              try:
+                  d, s, g = float(d), float(s), float(g)
+              except (TypeError, ValueError):
+                  raise RuntimeError("Truksta vejo duomenu.") from None
+              if not all(math.isfinite(v) for v in (d, s, g)):
+                  raise RuntimeError("Netinkami vejo duomenys.")
+              if not 0 <= d <= 360 or min(s, g) < 0:
+                  raise RuntimeError("Vejo reiksmes uz leistinu ribu.")
+              return d, s, g
+
+          def suitable(d, s):
+              return 90 <= d <= 135 and s >= MIN_SPEED
+
+          def periods(rows):
+              groups = []
+              for row in rows:
+                  if not suitable(row[1], row[2]):
+                      continue
+                  if groups and row[0] - groups[-1][-1][0] == 3600:
+                      groups[-1].append(row)
+                  else:
+                      groups.append([row])
+              lines = []
+              for group in groups:
+                  start = datetime.fromtimestamp(group[0][0], ZONE)
+                  end = datetime.fromtimestamp(group[-1][0] + 3600, ZONE)
+                  end_text = end.strftime("%H:%M")
+                  if end.date() != start.date():
+                      end_text = "24:00"
+                  speeds = [r[2] for r in group]
+                  gusts = [r[3] for r in group]
+                  lines.append(
+                      f"{start:%H:%M}–{end_text}: "
+                      f"{min(speeds):.1f}–{max(speeds):.1f} m/s; "
+                      f"gūsiai iki {max(gusts):.1f} m/s"
+                  )
+              return lines
+
           def main():
               token = os.environ.get("TOKEN", "").strip()
               chat = os.environ.get("CHAT", "").strip()
@@ -57,63 +100,167 @@ jobs:
               if not token or not chat:
                   raise RuntimeError("Truksta TOKEN arba CHAT_ID Secrets nustatymuose.")
 
+              now = datetime.now(ZONE)
+              today = now.date()
+              dates = [today + timedelta(days=n) for n in range(3)]
+              keys = [d.isoformat() for d in dates]
+              slot = f"{today.isoformat()}-{now.hour // 3}"
+
+              state = {"summary_slot": "", "days": {}}
+              if STATE.exists():
+                  state = json.loads(STATE.read_text())
+                  if not isinstance(state.get("days"), dict):
+                      raise RuntimeError("Netinkamas busenos failas.")
+
               params = urllib.parse.urlencode({
                   "latitude": 55.4566591,
                   "longitude": 21.1061368,
                   "current": "wind_speed_10m,wind_direction_10m,wind_gusts_10m",
+                  "hourly": "wind_speed_10m,wind_direction_10m,wind_gusts_10m",
                   "wind_speed_unit": "ms",
-                  "timeformat": "unixtime"
+                  "timezone": "Europe/Vilnius",
+                  "timeformat": "unixtime",
+                  "forecast_days": 4
               })
-              print("Gaunami Open-Meteo duomenys...", flush=True)
+              print("Gaunami vejo ir prognozes duomenys...", flush=True)
               w = api("https://api.open-meteo.com/v1/forecast?" + params, "Open-Meteo")
+
               c = w["current"]
-              d = float(c["wind_direction_10m"])
-              s = float(c["wind_speed_10m"])
-              g = float(c["wind_gusts_10m"])
-              t = float(c["time"])
+              d, s, g = values(
+                  c["wind_direction_10m"],
+                  c["wind_speed_10m"],
+                  c["wind_gusts_10m"]
+              )
+              current_time = float(c["time"])
+              age = now.timestamp() - current_time
+              if not math.isfinite(age) or not -1800 <= age <= 7200:
+                  raise RuntimeError("Dabartinio vejo duomenys pasene.")
 
-              if not all(math.isfinite(v) for v in (d, s, g, t)):
-                  raise RuntimeError("Netinkami vejo duomenys.")
-              if not 0 <= d <= 360 or min(s, g) < 0:
-                  raise RuntimeError("Netinkamos vejo reiksmes.")
-              age = datetime.now(timezone.utc).timestamp() - t
-              if not -1800 <= age <= 7200:
-                  raise RuntimeError("Duomenu laikas netinkamas arba pasenes.")
+              h = w["hourly"]
+              arrays = [
+                  h["time"], h["wind_direction_10m"],
+                  h["wind_speed_10m"], h["wind_gusts_10m"]
+              ]
+              if len({len(a) for a in arrays}) != 1:
+                  raise RuntimeError("Netinkama prognozes struktura.")
 
-              inside = 90 <= d <= 135
-              path = Path("wind_state.json")
-              previous = False
-              if path.exists():
-                  previous = json.loads(path.read_text())["inside"]
-                  if not isinstance(previous, bool):
-                      raise RuntimeError("Netinkamas busenos failas.")
+              days = {key: [] for key in keys}
+              for t, hd, hs, hg in zip(*arrays):
+                  t = float(t)
+                  local = datetime.fromtimestamp(t, ZONE)
+                  key = local.date().isoformat()
+                  if key in days:
+                      hd, hs, hg = values(hd, hs, hg)
+                      days[key].append((t, hd, hs, hg))
 
-              print(f"Kryptis {d:.0f}°, greitis {s:.1f} m/s", flush=True)
-              if test or (inside and not previous):
-                  title = "Bandomoji zinute" if test else "Vejo pranesimas"
-                  date = datetime.fromtimestamp(t, ZoneInfo("Europe/Vilnius"))
-                  condition = "TAIP" if inside else "NE"
-                  text = (
-                      f"{title}\n"
-                      "Vieta: 55.4566591, 21.1061368\n"
-                      f"Vejo kryptis is: {d:.0f}°\n"
-                      f"Greitis: {s:.1f} m/s\n"
-                      f"Gusiai: {g:.1f} m/s\n"
-                      f"90-135° intervale: {condition}\n"
-                      f"Laikas: {date:%Y-%m-%d %H:%M}\n"
-                      "Saltinis: Open-Meteo modelio duomenys"
-                  )
-                  data = urllib.parse.urlencode({"chat_id": chat, "text": text}).encode()
-                  print("Siunciama Telegram zinute...", flush=True)
-                  result = api(f"https://api.telegram.org/bot{token}/sendMessage", "Telegram", data)
-                  if result.get("ok") is not True:
-                      raise RuntimeError("Telegram nepatvirtino siuntimo.")
-                  print("Zinute issiusta.")
+              if any(not rows for rows in days.values()):
+                  raise RuntimeError("Truksta vienos is dienu prognozes.")
+
+              summary_due = state.get("summary_slot") != slot
+              notices = []
+
+              for ahead in (1, 2):
+                  key = keys[ahead]
+                  good = any(suitable(r[1], r[2]) for r in days[key])
+                  previous = state["days"].get(key, {})
+                  alerted = previous.get("alerted", False)
+                  stages = previous.get("stages", [])
+                  last_good = previous.get("good", False)
+
+                  if good and alerted and not last_good:
+                      notices.append(f"✅ {key}: tinkamas vėjas vėl prognozuojamas.")
+                  elif good and ahead not in stages:
+                      label = (
+                          "Pranešimas prieš 2 dienas"
+                          if ahead == 2 else "Priminimas prieš 1 dieną"
+                      )
+                      notices.append(f"📅 {label}: {key}.")
+                  elif not good and alerted and last_good:
+                      notices.append(
+                          f"⚠️ {key}: anksčiau numatytas tinkamas vėjas "
+                          "nebeprognozuojamas."
+                      )
+
+                  if good:
+                      alerted = True
+                      if ahead not in stages:
+                          stages.append(ahead)
+                  state["days"][key] = {
+                      "good": good, "alerted": alerted, "stages": stages
+                  }
+
+              if test or summary_due or notices:
+                  title = "🧪 Bandomoji suvestinė" if test else "🌬 Vėjo informacija"
+                  current_date = datetime.fromtimestamp(current_time, ZONE)
+                  condition = "TAIP" if suitable(d, s) else "NE"
+                  parts = [
+                      title,
+                      "📍 55.4566591, 21.1061368",
+                      "Sąlyga: 90–135° ir bent 6 m/s",
+                      "",
+                      f"Dabar ({current_date:%m-%d %H:%M}):",
+                      f"Kryptis iš {d:.0f}°; greitis {s:.1f} m/s",
+                      f"Gūsiai {g:.1f} m/s; sąlyga tenkinama: {condition}"
+                  ]
+                  if notices:
+                      parts += [""] + notices
+                  if summary_due or test:
+                      parts += ["", "Suvestinė kas 3 valandas"]
+
+                  for ahead, key in enumerate(keys):
+                      label = ["Šiandien", "Rytoj", "Poryt"][ahead]
+                      rows = days[key]
+                      if ahead == 0:
+                          hour_start = now.replace(
+                              minute=0, second=0, microsecond=0
+                          ).timestamp()
+                          rows = [r for r in rows if r[0] >= hour_start]
+                      lines = periods(rows)
+                      parts += ["", f"{label}, {key}:"]
+                      parts += lines or ["Tinkamo vėjo nenumatoma."]
+
+                  parts += [
+                      "",
+                      "Laikas – Lietuvos. Šaltinis: Open-Meteo modelis.",
+                      "Prognozė gali keistis."
+                  ]
+
+                  # Ilgesne suvestine padalijama i kelias zinutes.
+                  messages = []
+                  chunk = ""
+                  for line in parts:
+                      addition = line + "\n"
+                      if len(chunk) + len(addition) > 3500:
+                          messages.append(chunk)
+                          chunk = ""
+                      chunk += addition
+                  if chunk:
+                      messages.append(chunk)
+
+                  for text in messages:
+                      payload = urllib.parse.urlencode({
+                          "chat_id": chat, "text": text
+                      }).encode()
+                      reply = api(
+                          f"https://api.telegram.org/bot{token}/sendMessage",
+                          "Telegram", payload
+                      )
+                      if reply.get("ok") is not True:
+                          raise RuntimeError("Telegram nepatvirtino siuntimo.")
+                  print("Informacija issiusta.")
+                  if summary_due:
+                      state["summary_slot"] = slot
               else:
                   print("Naujo pranesimo nereikia.")
 
               if not test:
-                  path.write_text(json.dumps({"inside": inside}) + "\n")
+                  state["days"] = {
+                      k: v for k, v in state["days"].items()
+                      if k >= today.isoformat()
+                  }
+                  STATE.write_text(
+                      json.dumps(state, ensure_ascii=False) + "\n"
+                  )
 
           try:
               main()
@@ -125,12 +272,12 @@ jobs:
 
       - name: Issaugoti busena
         run: |
-          if [ -f wind_state.json ]; then
+          if [ -f wind_alert_state.json ]; then
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add wind_state.json
+            git add wind_alert_state.json
             if ! git diff --cached --quiet; then
-              git commit -m "Update wind state"
+              git commit -m "Update wind alert state"
               git push
             fi
           fi
